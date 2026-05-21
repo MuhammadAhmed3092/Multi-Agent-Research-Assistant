@@ -1,0 +1,31 @@
+version: "3.9"
+
+services:
+
+  backend:
+    build: .
+    container_name: research_backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./uploads:/app/uploads
+      - ./chroma_db:/app/chroma_db
+      - ./research_assistant.db:/app/research_assistant.db
+    restart: unless-stopped
+
+  frontend:
+    image: node:20-alpine
+    container_name: research_frontend
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8000/api
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    depends_on:
+      - backend
+    restart: unless-stopped

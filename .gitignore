@@ -1,0 +1,27 @@
+# Environment — NEVER commit this
+.env
+.env.example
+
+# Database & uploads (user data)
+*.db
+uploads/
+chroma_db/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# OS
+.DS_Store
+Thumbs.db
