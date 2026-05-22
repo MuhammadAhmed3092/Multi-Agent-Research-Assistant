@@ -1,69 +1,89 @@
 import { useState, useRef, useEffect } from "react";
 
+// Vercel injects VITE_API_URL at build time
+// Fallback to localhost for local dev
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000/api";
 
 const AGENT_META = {
-  orchestrator:  { icon: "🧠", label: "Orchestrator",   color: "#7F77DD" },
-  web_search:    { icon: "🔍", label: "Web Search",     color: "#378ADD" },
-  pdf_reader:    { icon: "📄", label: "PDF Reader",     color: "#1D9E75" },
-  code_executor: { icon: "💻", label: "Code Executor",  color: "#BA7517" },
-  summarizer:    { icon: "✍️",  label: "Summarizer",    color: "#D85A30" },
+  orchestrator:  { icon: "🧠", label: "Orchestrator",  color: "#7F77DD" },
+  web_search:    { icon: "🔍", label: "Web Search",    color: "#378ADD" },
+  pdf_reader:    { icon: "📄", label: "PDF Reader",    color: "#1D9E75" },
+  code_executor: { icon: "💻", label: "Code Executor", color: "#BA7517" },
+  summarizer:    { icon: "✍️",  label: "Summarizer",   color: "#D85A30" },
 };
 
-function QuotaBadge({ used, limit, resetAt }) {
+function QuotaBadge({ used, limit, resetAt, loading }) {
+  if (loading) return (
+    <div style={{ padding: "8px 14px", background: "#f9f9f9",
+                  border: "1px solid #eee", borderRadius: 8, fontSize: 13, color: "#aaa" }}>
+      Checking quota…
+    </div>
+  );
   const remaining = Math.max(0, limit - used);
-  const pct       = (used / limit) * 100;
+  const pct       = limit > 0 ? (used / limit) * 100 : 0;
   const color     = remaining === 0 ? "#e53" : remaining <= 2 ? "#c80" : "#1D9E75";
-
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 10,
-                  padding: "8px 14px", background: "#f9f9f9",
+    <div style={{ padding: "8px 14px", background: "#f9f9f9",
                   border: "1px solid #eee", borderRadius: 8, fontSize: 13 }}>
-      <div style={{ flex: 1 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-          <span style={{ color: "#555" }}>Daily prompts</span>
-          <span style={{ fontWeight: 600, color }}>
-            {remaining} / {limit} left
-          </span>
-        </div>
-        <div style={{ height: 4, background: "#e8e8e8", borderRadius: 2 }}>
-          <div style={{ height: 4, width: `${pct}%`, background: color,
-                        borderRadius: 2, transition: "width 0.4s" }} />
-        </div>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+        <span style={{ color: "#555" }}>Daily prompts</span>
+        <span style={{ fontWeight: 600, color }}>{remaining} / {limit} left</span>
+      </div>
+      <div style={{ height: 4, background: "#e8e8e8", borderRadius: 2 }}>
+        <div style={{ height: 4, width: `${pct}%`, background: color,
+                      borderRadius: 2, transition: "width 0.4s" }} />
       </div>
       {remaining === 0 && resetAt && (
-        <span style={{ fontSize: 11, color: "#999", whiteSpace: "nowrap" }}>
-          resets {new Date(resetAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-        </span>
+        <div style={{ fontSize: 11, color: "#999", marginTop: 4 }}>
+          Resets at {new Date(resetAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+        </div>
       )}
     </div>
   );
 }
 
 export default function App() {
-  const [query,     setQuery]     = useState("");
-  const [steps,     setSteps]     = useState([]);
-  const [sources,   setSources]   = useState([]);
-  const [answer,    setAnswer]    = useState("");
-  const [status,    setStatus]    = useState("idle");
-  const [pdfFile,   setPdfFile]   = useState("");
-  const [error,     setError]     = useState("");
-  const [quota,     setQuota]     = useState({ used: 0, limit: 6, remaining: 6, reset_at: "" });
-  const [exceeded,  setExceeded]  = useState(false);
+  const [query,      setQuery]      = useState("");
+  const [steps,      setSteps]      = useState([]);
+  const [sources,    setSources]    = useState([]);
+  const [answer,     setAnswer]     = useState("");
+  const [status,     setStatus]     = useState("idle");
+  const [pdfFile,    setPdfFile]    = useState("");
+  const [error,      setError]      = useState("");
+  const [exceeded,   setExceeded]   = useState(false);
+  const [quota,      setQuota]      = useState({ used: 0, limit: 6, remaining: 6, reset_at: "" });
+  const [quotaLoad,  setQuotaLoad]  = useState(true);
+  const [connError,  setConnError]  = useState("");
   const fileRef = useRef();
 
   useEffect(() => {
+    setQuotaLoad(true);
+    setConnError("");
     fetch(`${API}/quota`)
-      .then(r => r.json())
-      .then(d => setQuota({ used: d.prompts_used, limit: d.prompt_limit,
-                             remaining: d.prompts_remaining, reset_at: d.quota_reset_at }))
-      .catch(() => {});
+      .then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then(d => {
+        setQuota({
+          used:      d.prompts_used,
+          limit:     d.prompt_limit,
+          remaining: d.prompts_remaining,
+          reset_at:  d.quota_reset_at,
+        });
+        setQuotaLoad(false);
+      })
+      .catch(e => {
+        setConnError(`Cannot reach backend at: ${API} — ${e.message}`);
+        setQuotaLoad(false);
+      });
   }, []);
 
   async function uploadPdf(file) {
     const form = new FormData();
     form.append("file", file);
     const res  = await fetch(`${API}/upload`, { method: "POST", body: form });
+    if (!res.ok) { setError("PDF upload failed"); return; }
     const data = await res.json();
     setPdfFile(data.saved_as);
   }
@@ -73,11 +93,18 @@ export default function App() {
     setSteps([]); setSources([]); setAnswer("");
     setError(""); setExceeded(false); setStatus("running");
 
-    const res = await fetch(`${API}/research`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query, pdf_filenames: pdfFile ? [pdfFile] : [] }),
-    });
+    let res;
+    try {
+      res = await fetch(`${API}/research`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query, pdf_filenames: pdfFile ? [pdfFile] : [] }),
+      });
+    } catch (e) {
+      setError(`Cannot reach backend: ${e.message}`);
+      setStatus("error");
+      return;
+    }
 
     const reader  = res.body.getReader();
     const decoder = new TextDecoder();
@@ -98,8 +125,7 @@ export default function App() {
         const data  = JSON.parse(dLine.replace("data:", "").trim());
 
         if (event === "start") {
-          setQuota({ used: data.prompts_used, limit: data.prompt_limit,
-                     remaining: data.prompts_remaining, reset_at: quota.reset_at });
+          setQuota(q => ({ ...q, used: data.prompts_used, remaining: data.prompts_remaining }));
         }
         if (event === "step")    setSteps(s => [...s, data]);
         if (event === "sources") setSources(data.sources);
@@ -108,11 +134,13 @@ export default function App() {
           setStatus("done");
           setQuota(q => ({ ...q, used: data.prompts_used, remaining: data.prompts_remaining }));
         }
-        if (event === "error")         { setError(data.message); setStatus("error"); }
-        if (event === "quota_exceeded"){ setExceeded(true); setStatus("idle"); }
+        if (event === "error")          { setError(data.message); setStatus("error"); }
+        if (event === "quota_exceeded") { setExceeded(true); setStatus("idle"); }
       }
     }
   }
+
+  const blocked = exceeded || quota.remaining === 0;
 
   return (
     <div style={{ maxWidth: 880, margin: "0 auto", padding: "2rem 1rem",
@@ -120,7 +148,7 @@ export default function App() {
 
       {/* Header */}
       <div style={{ marginBottom: "1.5rem" }}>
-        <h1 style={{ fontSize: 24, fontWeight: 700, margin: 0, color: "#1a1a1a" }}>
+        <h1 style={{ fontSize: 24, fontWeight: 700, margin: 0 }}>
           🧠 Multi-Agent Research Assistant
         </h1>
         <p style={{ color: "#777", marginTop: 5, fontSize: 13 }}>
@@ -128,44 +156,53 @@ export default function App() {
         </p>
       </div>
 
-      {/* Quota tracker */}
+      {/* Connection error — shown when backend unreachable */}
+      {connError && (
+        <div style={{ background: "#fff8e1", border: "1px solid #ffe082",
+                      borderRadius: 8, padding: "12px 16px", marginBottom: 16, fontSize: 13 }}>
+          <strong>⚠ Backend connection issue:</strong><br />
+          {connError}<br /><br />
+          <strong>Fix:</strong> In Vercel → your project → Settings → Environment Variables<br />
+          Set <code>VITE_API_URL</code> = <code>https://your-render-app.onrender.com/api</code><br />
+          Then redeploy on Vercel (Deployments → Redeploy).
+        </div>
+      )}
+
+      {/* Quota */}
       <div style={{ marginBottom: 16 }}>
-        <QuotaBadge used={quota.used} limit={quota.limit} resetAt={quota.reset_at} />
+        <QuotaBadge used={quota.used} limit={quota.limit}
+                    resetAt={quota.reset_at} loading={quotaLoad} />
       </div>
 
-      {/* Quota exceeded banner */}
+      {/* Quota exceeded */}
       {exceeded && (
         <div style={{ background: "#fff3f3", border: "1px solid #fcc",
                       borderRadius: 8, padding: "14px 18px", marginBottom: 16 }}>
-          <p style={{ margin: 0, fontWeight: 600, color: "#c00", fontSize: 14 }}>
-            Daily limit reached
-          </p>
+          <p style={{ margin: 0, fontWeight: 600, color: "#c00" }}>Daily limit reached</p>
           <p style={{ margin: "6px 0 0", color: "#555", fontSize: 13 }}>
-            You've used all {quota.limit} free prompts for today.
-            Your quota resets every 24 hours.
+            You've used all {quota.limit} free prompts. Quota resets every 24 hours.
           </p>
         </div>
       )}
 
-      {/* Input row */}
+      {/* Input */}
       <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
         <input
           value={query}
           onChange={e => setQuery(e.target.value)}
           onKeyDown={e => e.key === "Enter" && runResearch()}
           placeholder="Ask a research question…"
-          disabled={status === "running" || exceeded || quota.remaining === 0}
+          disabled={status === "running" || blocked}
           style={{ flex: 1, padding: "10px 14px", fontSize: 15,
-                   border: "1px solid #ddd", borderRadius: 8,
-                   outline: "none", color: "#1a1a1a" }}
+                   border: "1px solid #ddd", borderRadius: 8, outline: "none" }}
         />
         <button
           onClick={runResearch}
-          disabled={status === "running" || !query.trim() || exceeded || quota.remaining === 0}
+          disabled={status === "running" || !query.trim() || blocked}
           style={{ padding: "10px 22px", fontSize: 14, fontWeight: 600,
-                   background: (status === "running" || quota.remaining === 0) ? "#bbb" : "#534AB7",
+                   background: (status === "running" || blocked) ? "#bbb" : "#534AB7",
                    color: "#fff", border: "none", borderRadius: 8,
-                   cursor: status === "running" ? "not-allowed" : "pointer" }}>
+                   cursor: (status === "running" || blocked) ? "not-allowed" : "pointer" }}>
           {status === "running" ? "Researching…" : "Research ↗"}
         </button>
       </div>
@@ -190,7 +227,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Agent activity */}
+      {/* Steps */}
       {steps.length > 0 && (
         <div style={{ background: "#f8f8f8", border: "1px solid #eee",
                       borderRadius: 10, padding: "14px 16px", marginBottom: 20 }}>
@@ -200,33 +237,41 @@ export default function App() {
           {steps.map((step, i) => {
             const m = AGENT_META[step.agent] || { icon: "•", label: step.agent, color: "#888" };
             return (
-              <div key={i} style={{ display: "flex", gap: 10, marginBottom: 8, fontSize: 13, alignItems: "flex-start" }}>
+              <div key={i} style={{ display: "flex", gap: 10, marginBottom: 8,
+                                    fontSize: 13, alignItems: "flex-start" }}>
                 <span>{m.icon}</span>
                 <div>
                   <span style={{ fontWeight: 600, color: m.color }}>{m.label}</span>
                   <span style={{ color: "#444", marginLeft: 6 }}>{step.action}</span>
-                  {step.detail && <span style={{ color: "#999", marginLeft: 6, fontSize: 12 }}>— {step.detail}</span>}
+                  {step.detail && (
+                    <span style={{ color: "#999", marginLeft: 6, fontSize: 12 }}>
+                      — {step.detail}
+                    </span>
+                  )}
                 </div>
               </div>
             );
           })}
-          {status === "running" && <p style={{ margin: "8px 0 0", color: "#aaa", fontSize: 12 }}>⏳ Working…</p>}
+          {status === "running" && (
+            <p style={{ margin: "8px 0 0", color: "#aaa", fontSize: 12 }}>⏳ Working…</p>
+          )}
         </div>
       )}
 
-      {/* Sources grid */}
+      {/* Sources */}
       {sources.length > 0 && (
         <div style={{ marginBottom: 20 }}>
           <p style={{ fontWeight: 600, fontSize: 13, color: "#333", marginBottom: 10 }}>
             Sources ({sources.length})
           </p>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(250px,1fr))", gap: 10 }}>
+          <div style={{ display: "grid",
+                        gridTemplateColumns: "repeat(auto-fill, minmax(250px,1fr))", gap: 10 }}>
             {sources.map((s, i) => {
               const m = AGENT_META[s.agent] || {};
               return (
                 <div key={i} style={{ background: "#fff", border: "1px solid #e8e8e8",
                                       borderRadius: 8, padding: "10px 14px" }}>
-                  <div style={{ fontSize: 11, color: m.color || "#888", fontWeight: 600, marginBottom: 4 }}>
+                  <div style={{ fontSize: 11, color: m.color, fontWeight: 600, marginBottom: 4 }}>
                     {m.icon} {m.label}
                   </div>
                   <div style={{ fontWeight: 500, fontSize: 13, marginBottom: 4 }}>
@@ -247,19 +292,24 @@ export default function App() {
         </div>
       )}
 
-      {/* Final answer */}
+      {/* Answer */}
       {answer && (
         <div style={{ background: "#fff", border: "1px solid #e0dff8",
                       borderRadius: 10, padding: "20px 24px" }}>
           <p style={{ fontWeight: 700, fontSize: 13, color: "#534AB7", marginBottom: 14 }}>
             ✍️ Research Answer
           </p>
-          <div style={{ fontSize: 15, lineHeight: 1.8, color: "#1a1a1a",
-                        whiteSpace: "pre-wrap" }}>
+          <div style={{ fontSize: 15, lineHeight: 1.8, color: "#1a1a1a", whiteSpace: "pre-wrap" }}>
             {answer}
           </div>
         </div>
       )}
+
+      {/* Debug info — remove after confirming it works */}
+      <div style={{ marginTop: 40, padding: "10px 14px", background: "#f5f5f5",
+                    borderRadius: 6, fontSize: 11, color: "#999" }}>
+        API: {API}
+      </div>
     </div>
   );
 }
