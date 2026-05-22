@@ -1,10 +1,6 @@
 """
-api/routes.py — FastAPI routes with:
-  - User fingerprinting (IP + user-agent hash)
-  - 6-prompt quota per user per 24h
-  - Full query + agent-step logging to SQLite
-  - SSE streaming research endpoint
-  - Admin dashboard endpoint (protected by ADMIN_KEY)
+api/routes.py — FastAPI routes with quota limiting, logging, and SSE streaming.
+Uses /tmp for uploads on Render free tier (ephemeral but works per-request).
 """
 
 from __future__ import annotations
@@ -25,13 +21,25 @@ from db import (
     PROMPT_LIMIT,
 )
 
-router     = APIRouter()
-UPLOAD_DIR = Path("./uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
+router = APIRouter()
+
+# Use /tmp for Render free tier (writable, ephemeral — fine for single request lifecycle)
+# Use ./uploads for local dev
+def get_upload_dir() -> Path:
+    tmp = Path("/tmp/ra_uploads")
+    try:
+        tmp.mkdir(parents=True, exist_ok=True)
+        return tmp
+    except Exception:
+        local = Path("./uploads")
+        local.mkdir(exist_ok=True)
+        return local
 
 
 def _fingerprint(request: Request) -> str:
-    ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
+    ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    if not ip:
+        ip = request.client.host if request.client else "unknown"
     ua = request.headers.get("user-agent", "")
     return hashlib.sha256(f"{ip}::{ua}".encode()).hexdigest()[:32]
 
@@ -55,10 +63,12 @@ async def health():
 async def upload_pdf(file: UploadFile = File(...)):
     if not file.filename.endswith(".pdf"):
         raise HTTPException(400, "Only PDF files accepted.")
+    upload_dir = get_upload_dir()
     safe = f"{uuid.uuid4()}_{file.filename}"
-    path = UPLOAD_DIR / safe
+    path = upload_dir / safe
     path.write_bytes(await file.read())
-    return {"filename": file.filename, "saved_as": safe}
+    logger.info(f"[Upload] Saved to {path}")
+    return {"filename": file.filename, "saved_as": safe, "upload_dir": str(upload_dir)}
 
 
 @router.get("/quota")
@@ -68,8 +78,9 @@ async def quota_status(request: Request):
     user = get_or_create_user(fp, ip)
     from db import get_conn
     with get_conn() as conn:
-        row = conn.execute("SELECT prompt_count, quota_reset_at FROM users WHERE id = ?",
-                           (user["id"],)).fetchone()
+        row = conn.execute(
+            "SELECT prompt_count, quota_reset_at FROM users WHERE id = ?", (user["id"],)
+        ).fetchone()
         count    = dict(row)["prompt_count"] if row else 0
         reset_at = dict(row)["quota_reset_at"] if row else ""
     return {
@@ -96,11 +107,21 @@ async def research(req: ResearchRequest, request: Request):
                 "prompt_limit": PROMPT_LIMIT,
                 "reset_info": "Quota resets every 24 hours.",
             })
-        return StreamingResponse(over(), media_type="text/event-stream")
+        return StreamingResponse(over(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache"})
 
-    pdf_paths = [str(UPLOAD_DIR / f) for f in req.pdf_filenames
-                 if (UPLOAD_DIR / f).exists()]
-    query_id  = log_query_start(user["id"], session_id, req.query)
+    # Resolve uploaded PDF paths from /tmp
+    upload_dir = get_upload_dir()
+    pdf_paths  = []
+    for fname in req.pdf_filenames:
+        p = upload_dir / fname
+        if p.exists():
+            pdf_paths.append(str(p))
+            logger.info(f"[Research] PDF found: {p}")
+        else:
+            logger.warning(f"[Research] PDF not found: {p} — skipping")
+
+    query_id = log_query_start(user["id"], session_id, req.query)
 
     async def stream():
         start = time.time()
@@ -109,6 +130,7 @@ async def research(req: ResearchRequest, request: Request):
                 "session_id": session_id, "query": req.query,
                 "prompts_used": used, "prompts_remaining": remaining,
                 "prompt_limit": PROMPT_LIMIT,
+                "pdf_count": len(pdf_paths),
             })
 
             state = initial_state(req.query, session_id, pdf_paths)
@@ -119,32 +141,44 @@ async def research(req: ResearchRequest, request: Request):
                 while seen < len(steps):
                     s = steps[seen]
                     log_agent_step(query_id, s.agent.value, s.action, s.status.value, s.detail)
-                    yield sse("step", {"agent": s.agent.value, "action": s.action,
-                                       "status": s.status.value, "detail": s.detail})
+                    yield sse("step", {
+                        "agent": s.agent.value, "action": s.action,
+                        "status": s.status.value, "detail": s.detail,
+                    })
                     seen += 1
                     await asyncio.sleep(0)
 
                 if chunk.get("final_answer") and chunk.get("status") == ResearchStatus.DONE:
-                    srcs = [{"id": s.id, "title": s.title, "url": s.url,
-                              "snippet": s.snippet[:300], "agent": s.agent.value, "score": s.score}
-                             for s in chunk.get("all_sources", [])]
+                    srcs = [
+                        {"id": s.id, "title": s.title, "url": s.url,
+                         "snippet": s.snippet[:300], "agent": s.agent.value, "score": s.score}
+                        for s in chunk.get("all_sources", [])
+                    ]
                     yield sse("sources", {"sources": srcs})
                     yield sse("answer",  {"answer": chunk["final_answer"]})
-                    log_query_complete(query_id, len(srcs),
-                                       len(chunk["final_answer"]),
-                                       int((time.time() - start) * 1000))
+                    log_query_complete(
+                        query_id, len(srcs),
+                        len(chunk["final_answer"]),
+                        int((time.time() - start) * 1000),
+                    )
 
-            yield sse("done", {"session_id": session_id,
-                                "prompts_used": used, "prompts_remaining": remaining})
+            yield sse("done", {
+                "session_id": session_id,
+                "prompts_used": used, "prompts_remaining": remaining,
+            })
 
         except Exception as e:
-            logger.error(f"[Research] {e}")
+            logger.error(f"[Research] Stream error: {e}")
             log_query_error(query_id, str(e))
             yield sse("error", {"message": str(e)})
 
-    return StreamingResponse(stream(), media_type="text/event-stream",
-                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return StreamingResponse(
+        stream(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
+
+# ── Admin routes ──────────────────────────────────────────────────────────────
 
 def _check_admin(key: str):
     if key != os.getenv("ADMIN_KEY", "changeme"):
